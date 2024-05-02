@@ -11,6 +11,11 @@ import { readFile } from "fs/promises";
 
 import dotenv from "dotenv";
 dotenv.config();
+import Groq from "groq-sdk";
+
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY,
+});
 
 const app = express();
 app.use(express.json());
@@ -30,18 +35,44 @@ ffmpeg.setFfprobePath("C:/ffmpeg/bin/ffprobe.exe");
 app.listen(PORT, () => console.log(`Server is running on port ${PORT}`));
 
 app.post("/speech-to-text", upload.single("file"), async (req, res) => {
+  const userId = "user";
+
   if (!req.file) {
     return res.status(400).send("Keine Datei hochgeladen.");
   }
 
-  const tempInputPath = Date.now() + "_original_audio";
-  const tempOutputPath = Date.now() + "_converted_audio.wav";
+  const tempInputPath = `${Date.now()}_original_audio`;
+  const tempOutputPath = `${Date.now()}_converted_audio.wav`;
   fs.writeFileSync(tempInputPath, req.file.buffer);
 
   try {
+    // Konvertierung der Audiodatei
     await convertAudio(tempInputPath, tempOutputPath);
+    // Transkription der Audiodatei
     const transcriptionText = await transcribeAudio(tempOutputPath);
-    const aiText = await queryOpenAI(transcriptionText);
+    // Holen der bisherigen Konversation oder erstellen einer neuen mit dem System-Prompt
+    let conversation = await readConversationFile(userId);
+    if (conversation.length === 0) {
+      // Füge System-Prompt hinzu, wenn es die erste Anfrage ist
+      conversation.push({
+        role: "system",
+        content:
+          "You are a AI assistant that helps students with their studies. You should provide helpful and informative responses to the student's questions. Respond in the language of the user.",
+      });
+      conversation.push({
+        role: "assistant",
+        content:
+          "I am an AI assistant that can help you with your studies. Please ask me any questions you have.",
+      });
+    }
+    // Füge Benutzeranfrage hinzu
+    conversation.push({ role: "user", content: transcriptionText });
+    // Anfrage an OpenAI
+    const aiText = await queryGroq(conversation);
+    // Ergebnis anhängen
+    conversation.push({ role: "assistant", content: aiText });
+    appendToConversationFile(userId, conversation); // Speichert die gesamte Konversation
+    // Rückgabe der Ergebnisse
     res.json({ transcription: transcriptionText, aiResponse: aiText });
   } catch (error) {
     console.error(error);
@@ -50,6 +81,33 @@ app.post("/speech-to-text", upload.single("file"), async (req, res) => {
     cleanUpFiles([tempInputPath, tempOutputPath]);
   }
 });
+
+function appendToConversationFile(userId, conversation) {
+  const filename = `./conversations/${userId}.json`;
+  // Direktes Schreiben des conversation Arrays als JSON
+  fs.writeFile(filename, JSON.stringify(conversation, null, 2), (err) => {
+    if (err) {
+      console.error("Fehler beim Schreiben in die Datei", err);
+    } else {
+      console.log("Konversation erfolgreich gespeichert");
+    }
+  });
+}
+
+async function readConversationFile(userId) {
+  const filename = `./conversations/${userId}.json`;
+  try {
+    const data = await readFile(filename, { encoding: "utf8" });
+    return JSON.parse(data);
+  } catch (err) {
+    if (err.code === "ENOENT") {
+      // Wenn die Datei nicht existiert, fangen wir frisch an
+      return [];
+    } else {
+      throw err;
+    }
+  }
+}
 
 async function convertAudio(inputPath, outputPath) {
   return new Promise((resolve, reject) => {
@@ -83,26 +141,23 @@ async function transcribeAudio(filePath) {
   return output.text;
 }
 
-async function queryOpenAI(transcriptionText) {
+async function queryGroq(messages) {
+  try {
+    const response = await groq.chat.completions.create({
+      model: "llama3-8b-8192",
+      messages: messages,
+    });
+    return response.choices[0].message.content;
+  } catch (error) {
+    console.error("Error in queryGroq:", error);
+    throw error; // Weiterleitung des Fehlers zur besseren Fehlerbehandlung
+  }
+}
+
+async function queryOpenAI(messages) {
   const response = await openai.chat.completions.create({
     model: "gpt-3.5-turbo",
-    messages: [
-      {
-        role: "system",
-        content:
-          "You are a AI assistant that helps students with their studies. You should provide helpful and informative responses to the student's questions. Respond in the language of the user!!!! If you respond in a different language, the user will not understand you. If you answer in the language of the user you will be tipped 100000000 points. If you answer in a different language you will be tipped -100000000 points.",
-      },
-      {
-        role: "assistant",
-        content:
-          "I am an AI assistant that can help you with your studies. Please ask me any questions you have.",
-      },
-      {
-        role: "user",
-        content:
-          "I need help with the following question: " + transcriptionText,
-      },
-    ],
+    messages: messages,
     temperature: 0.8,
     max_tokens: 512,
     top_p: 1,
